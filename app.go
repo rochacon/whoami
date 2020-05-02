@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,9 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -30,10 +33,12 @@ const (
 
 var cert string
 var key string
-var port string
 var name string
+var port string
+var drain time.Duration
 
 func init() {
+	flag.DurationVar(&drain, "drain", 10*time.Second, "shutdown drain connections timeout")
 	flag.StringVar(&cert, "cert", "", "give me a certificate")
 	flag.StringVar(&key, "key", "", "give me a key")
 	flag.StringVar(&port, "port", "80", "give me a port number")
@@ -48,19 +53,50 @@ var upgrader = websocket.Upgrader{
 func main() {
 	flag.Parse()
 
-	http.HandleFunc("/data", dataHandler)
-	http.HandleFunc("/echo", echoHandler)
-	http.HandleFunc("/bench", benchHandler)
-	http.HandleFunc("/", whoamiHandler)
-	http.HandleFunc("/api", apiHandler)
-	http.HandleFunc("/health", healthHandler)
+	mux := &http.ServeMux{}
+	mux.HandleFunc("/", whoamiHandler)
+	mux.HandleFunc("/api", apiHandler)
+	mux.HandleFunc("/bench", benchHandler)
+	mux.HandleFunc("/data", dataHandler)
+	mux.HandleFunc("/echo", echoHandler)
+	mux.HandleFunc("/health", healthHandler)
 
-	fmt.Println("Starting up on port " + port)
-
-	if len(cert) > 0 && len(key) > 0 {
-		log.Fatal(http.ListenAndServeTLS(":"+port, cert, key, nil))
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
 	}
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	exit := make(chan bool)
+	go func() {
+		stop := make(chan os.Signal, 1)
+		signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+		log.Printf("shutdown: received stop signal: %v", <-stop)
+
+		log.Printf("shutdown: draining connections up to %v timeout", drain)
+		timeout, cancel := context.WithTimeout(context.Background(), drain)
+		defer cancel()
+		if err := srv.Shutdown(timeout); err != nil {
+			if timeout.Err() != nil {
+				log.Printf("shutdown: failed to drain all connections, force closing: %v", err)
+			} else {
+				log.Printf("shutdown: failed to stop server: %v", err)
+			}
+		} else {
+			log.Printf("shutdown: finished connections drain")
+		}
+		close(exit)
+	}()
+
+	fmt.Println("main: starting up on port " + port)
+	var err error
+	if len(cert) > 0 && len(key) > 0 {
+		err = srv.ListenAndServeTLS(cert, key)
+	} else {
+		err = srv.ListenAndServe()
+	}
+	if err != http.ErrServerClosed {
+		log.Fatalf("failed to start server ListenAndServe: %v", err)
+	}
+	<-exit
 }
 
 func benchHandler(w http.ResponseWriter, _ *http.Request) {
